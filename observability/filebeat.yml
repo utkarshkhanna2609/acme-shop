@@ -4,7 +4,13 @@ filebeat.autodiscover:
   providers:
     - type: docker
       hints.enabled: true
-      hints.default_config.enabled: false
+      # Off unless a container opts in with the label; this is the input the
+      # label turns on.
+      hints.default_config:
+        enabled: false
+        type: container
+        paths:
+          - /var/lib/docker/containers/${data.container.id}/*.log
 
 processors:
   - decode_json_fields:
