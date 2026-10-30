@@ -4,6 +4,8 @@ import logging
 import os
 import random
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -16,6 +18,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://acme:acme@postgres:5
 PAYMENTS_URL = os.environ.get("PAYMENTS_URL", "http://payments:8080")
 # Share of orders that hit the slow path (a lock-wait style stall in the DB).
 SLOW_RATE = float(os.environ.get("ORDERS_SLOW_RATE", "0.02"))
+PAYMENT_TIMEOUT = float(os.environ.get("PAYMENT_TIMEOUT_SECONDS", "1.0"))
+PAYMENT_MAX_ATTEMPTS = int(os.environ.get("PAYMENT_MAX_ATTEMPTS", "3"))
+PAYMENT_BACKOFF_SECONDS = float(os.environ.get("PAYMENT_BACKOFF_SECONDS", "0.1"))
+PAYMENT_FAILURE_THRESHOLD = int(os.environ.get("PAYMENT_FAILURE_THRESHOLD", "5"))
+PAYMENT_CIRCUIT_RESET_SECONDS = float(os.environ.get("PAYMENT_CIRCUIT_RESET_SECONDS", "30"))
 
 
 class JsonFormatter(logging.Formatter):
@@ -42,7 +49,72 @@ log.setLevel(logging.INFO)
 log.propagate = False
 
 app = FastAPI()
-http = httpx.Client(timeout=3.0)
+http = httpx.Client(timeout=PAYMENT_TIMEOUT)
+payment_circuit_lock = threading.Lock()
+payment_failures = 0
+payment_circuit_opened_at = None
+
+
+class PaymentCircuitOpen(Exception):
+    """Raised when payment-provider transient failures trip the circuit."""
+
+
+def _payment_circuit_is_open():
+    global payment_circuit_opened_at
+    with payment_circuit_lock:
+        if payment_circuit_opened_at is None:
+            return False
+        if time.monotonic() - payment_circuit_opened_at >= PAYMENT_CIRCUIT_RESET_SECONDS:
+            payment_circuit_opened_at = None
+            return False
+        return True
+
+
+def _record_payment_success():
+    global payment_failures, payment_circuit_opened_at
+    with payment_circuit_lock:
+        payment_failures = 0
+        payment_circuit_opened_at = None
+
+
+def _record_payment_transient_failure():
+    global payment_failures, payment_circuit_opened_at
+    with payment_circuit_lock:
+        payment_failures += 1
+        if payment_failures >= PAYMENT_FAILURE_THRESHOLD:
+            payment_circuit_opened_at = time.monotonic()
+
+
+def _charge_payment(order_id, amount):
+    """Charge once or retry only failures that are safe to retry."""
+    if _payment_circuit_is_open():
+        raise PaymentCircuitOpen
+
+    for attempt in range(PAYMENT_MAX_ATTEMPTS):
+        try:
+            response = http.post(
+                f"{PAYMENTS_URL}/charge",
+                json={"order_id": order_id, "amount_cents": amount},
+                headers={"Idempotency-Key": str(order_id)},
+            )
+            response.raise_for_status()
+            _record_payment_success()
+            return
+        except httpx.TimeoutException as exc:
+            error_kind = "timeout"
+        except httpx.NetworkError as exc:
+            error_kind = "network"
+        except httpx.HTTPError:
+            raise
+
+        if attempt + 1 == PAYMENT_MAX_ATTEMPTS:
+            _record_payment_transient_failure()
+            log.error(
+                "payment provider transient failure",
+                extra={"fields": {"order_id": order_id, "kind": error_kind, "attempts": PAYMENT_MAX_ATTEMPTS}},
+            )
+            raise exc
+        time.sleep(PAYMENT_BACKOFF_SECONDS * (2**attempt))
 
 
 class OrderIn(BaseModel):
@@ -79,8 +151,11 @@ def create_order(order: OrderIn):
         ).fetchone()[0]
 
         try:
-            r = http.post(f"{PAYMENTS_URL}/charge", json={"order_id": order_id, "amount_cents": amount})
-            r.raise_for_status()
+            _charge_payment(order_id, amount)
+        except PaymentCircuitOpen:
+            conn.execute("update orders set status = 'failed' where id = %s", (order_id,))
+            log.error("payment circuit open", extra={"fields": {"order_id": order_id}})
+            raise HTTPException(503, "payment provider unavailable")
         except httpx.HTTPError as exc:
             conn.execute("update orders set status = 'failed' where id = %s", (order_id,))
             log.error("payment failed", extra={"fields": {"order_id": order_id, "error": str(exc)}})
