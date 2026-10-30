@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import sys
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -16,6 +17,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://acme:acme@postgres:5
 PAYMENTS_URL = os.environ.get("PAYMENTS_URL", "http://payments:8080")
 # Share of orders that hit the slow path (a lock-wait style stall in the DB).
 SLOW_RATE = float(os.environ.get("ORDERS_SLOW_RATE", "0.02"))
+PAYMENT_MAX_ATTEMPTS = 3
+PAYMENT_RETRY_BACKOFF_SECONDS = 0.1
+RETRYABLE_PAYMENT_STATUS_CODES = {502, 503, 504}
 
 
 class JsonFormatter(logging.Formatter):
@@ -78,12 +82,35 @@ def create_order(order: OrderIn):
             (order.sku, order.qty, amount),
         ).fetchone()[0]
 
-        try:
-            r = http.post(f"{PAYMENTS_URL}/charge", json={"order_id": order_id, "amount_cents": amount})
-            r.raise_for_status()
-        except httpx.HTTPError as exc:
+        payment_error = None
+        for attempt in range(PAYMENT_MAX_ATTEMPTS):
+            try:
+                r = http.post(
+                    f"{PAYMENTS_URL}/charge",
+                    json={"order_id": order_id, "amount_cents": amount},
+                    headers={"Idempotency-Key": str(order_id)},
+                )
+                r.raise_for_status()
+                payment_error = None
+                break
+            except httpx.TimeoutException as exc:
+                payment_error = exc
+            except httpx.NetworkError as exc:
+                payment_error = exc
+            except httpx.HTTPStatusError as exc:
+                payment_error = exc
+                if exc.response.status_code not in RETRYABLE_PAYMENT_STATUS_CODES:
+                    break
+            except httpx.HTTPError as exc:
+                payment_error = exc
+                break
+
+            if attempt + 1 < PAYMENT_MAX_ATTEMPTS:
+                time.sleep(PAYMENT_RETRY_BACKOFF_SECONDS * (2**attempt))
+
+        if payment_error is not None:
             conn.execute("update orders set status = 'failed' where id = %s", (order_id,))
-            log.error("payment failed", extra={"fields": {"order_id": order_id, "error": str(exc)}})
+            log.error("payment failed", extra={"fields": {"order_id": order_id, "error": str(payment_error)}})
             raise HTTPException(502, "payment failed")
 
         conn.execute("update orders set status = 'paid' where id = %s", (order_id,))
