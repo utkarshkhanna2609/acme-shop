@@ -1,0 +1,130 @@
+name: acme
+
+x-otel: &otel
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_METRICS_EXPORTER: otlp
+  # Logs go to stdout and through Filebeat → Logstash → Elasticsearch.
+  OTEL_LOGS_EXPORTER: none
+  OTEL_RESOURCE_ATTRIBUTES: deployment.environment=${DEPLOY_ENV:-production},service.namespace=acme
+  # uvicorn and `flask run` are click commands: click's instrumentation would
+  # open one span for the process lifetime and parent every request under it.
+  OTEL_PYTHON_DISABLED_INSTRUMENTATIONS: click
+
+x-logs: &logs
+  co.elastic.logs/enabled: "true"
+
+services:
+  # ── Applications ────────────────────────────────────────────────────
+  storefront:
+    build: ./services/storefront
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: storefront
+      ORDERS_URL: http://orders:8080
+    labels: *logs
+    depends_on: [orders, otel-collector]
+
+  orders:
+    build: ./services/orders
+    restart: unless-stopped
+    environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: orders
+      DATABASE_URL: postgresql://acme:acme@postgres:5432/acme
+      PAYMENTS_URL: http://payments:8080
+      ORDERS_SLOW_RATE: ${ORDERS_SLOW_RATE:-0.02}
+    labels: *logs
+    depends_on: [postgres, payments, otel-collector]
+
+  payments:
+    build: ./services/payments
+    restart: unless-stopped
+    environment:
+      <<: *otel
+      OTEL_SERVICE_NAME: payments
+      PAYMENTS_FAIL_RATE: ${PAYMENTS_FAIL_RATE:-0.03}
+      PAYMENTS_EXTRA_LATENCY_MS: ${PAYMENTS_EXTRA_LATENCY_MS:-0}
+    labels: *logs
+    depends_on: [otel-collector]
+
+  loadgen:
+    build: ./services/loadgen
+    restart: unless-stopped
+    environment:
+      STOREFRONT_URL: http://storefront:8080
+      LOADGEN_RPS: ${LOADGEN_RPS:-4}
+    depends_on: [storefront]
+
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: acme
+      POSTGRES_PASSWORD: acme
+      POSTGRES_DB: acme
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  # ── Telemetry: OpenTelemetry Collector ──────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.120.0
+    container_name: otel-collector
+    restart: unless-stopped
+    command: ["--config", "/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+      - /:/hostfs:ro
+    depends_on: [postgres]
+
+  # ── Logging: ELK ────────────────────────────────────────────────────
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: elasticsearch
+    restart: unless-stopped
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.3
+    container_name: logstash
+    restart: unless-stopped
+    environment:
+      LS_JAVA_OPTS: -Xms512m -Xmx512m
+      xpack.monitoring.enabled: "false"
+    volumes:
+      - ./observability/logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+    depends_on: [elasticsearch]
+
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.3
+    container_name: filebeat
+    restart: unless-stopped
+    user: root
+    command: ["filebeat", "-e", "--strict.perms=false"]
+    volumes:
+      - ./observability/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [logstash]
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: kibana
+    restart: unless-stopped
+    ports: ["127.0.0.1:5601:5601"]
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on: [elasticsearch]
+
+volumes:
+  pgdata:
+  esdata:

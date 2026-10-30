@@ -1,0 +1,63 @@
+# The company's OpenTelemetry Collector. Every service sends traces and metrics
+# here over OTLP; the collector also scrapes the host and Postgres.
+#
+# Exporters: only `debug` for now. Add your observability vendor's exporter to
+# `exporters:` and to each pipeline below.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  hostmetrics:
+    root_path: /hostfs
+    collection_interval: 30s
+    scrapers: { cpu: {}, load: {}, memory: {}, disk: {}, filesystem: {}, network: {} }
+  postgresql:
+    endpoint: postgres:5432
+    transport: tcp
+    username: otel_monitor
+    password: otel_monitor
+    databases: [acme]
+    collection_interval: 30s
+    tls:
+      insecure: true
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 300
+  resourcedetection:
+    detectors: [env, system, ec2]
+    override: false
+  resource/postgres:
+    attributes:
+      - { key: service.name, value: postgres, action: upsert }
+  resource/host:
+    attributes:
+      - { key: service.name, value: host, action: insert }
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resourcedetection, batch]
+      exporters: [debug]
+    metrics/postgres:
+      receivers: [postgresql]
+      processors: [memory_limiter, resource/postgres, batch]
+      exporters: [debug]
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [memory_limiter, resourcedetection, resource/host, batch]
+      exporters: [debug]

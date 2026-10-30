@@ -1,0 +1,19 @@
+# Ships the JSON logs of every container labelled co.elastic.logs/enabled=true
+# to Logstash.
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      hints.enabled: true
+      hints.default_config.enabled: false
+
+processors:
+  - decode_json_fields:
+      fields: ["message"]
+      target: ""
+      overwrite_keys: true
+      add_error_key: true
+
+output.logstash:
+  hosts: ["logstash:5044"]
+
+logging.level: warning

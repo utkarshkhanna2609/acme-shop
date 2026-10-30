@@ -1,0 +1,14 @@
+{
+  "name": "storefront",
+  "version": "1.0.0",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node --require @opentelemetry/auto-instrumentations-node/register server.js"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/auto-instrumentations-node": "0.52.0",
+    "express": "4.21.1"
+  }
+}
