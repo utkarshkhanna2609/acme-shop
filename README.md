@@ -22,7 +22,7 @@ user `otel_monitor`). Its only exporter is `debug`; add your vendor's in
 
 **Logs → ELK.** Services write JSON lines to stdout with `trace_id` and
 `span_id`. Filebeat picks up containers labelled `co.elastic.logs/enabled=true`,
-ships to Logstash, and Logstash writes `logs-acme-YYYY.MM.DD` in
+ships to Logstash, and Logstash writes `acme-logs-YYYY.MM.DD` in
 Elasticsearch. Kibana is on `127.0.0.1:5601`. Outputs live in
 [`observability/logstash/logstash.conf`](observability/logstash/logstash.conf).
 
@@ -39,7 +39,7 @@ Check:
 ```bash
 curl -s localhost:8080/api/products
 docker logs otel-collector --tail 5          # "Traces ... spans: N"
-curl -s 'localhost:9200/logs-acme-*/_count'  # from inside the host: docker exec elasticsearch curl ...
+curl -s 'localhost:9200/acme-logs-*/_count'  # from inside the host: docker exec elasticsearch curl ...
 ```
 
 Kibana from your laptop, over SSM:
